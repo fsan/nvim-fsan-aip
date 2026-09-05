@@ -141,21 +141,16 @@ local function layout()
     col = math.floor((columns - width) / 2),
   }
   if w.layout == "columns" and (w.ratios.file or 0) > 0 and file_pane_ok(chat.origin_buf) then
-    -- three side-by-side panes: buffer | conversation | prompt
-    local content = width - 8 -- 3 borders (2 each) + 2 gaps
-    local r = w.ratios
+    -- buffer pane left, chat area (transcript over prompt) right
+    local content = width - 5 -- 2 borders + 1 gap between the two columns
     L.mode = "columns"
-    L.file_w = math.max(8, math.floor(content * r.file))
-    L.prompt_w = math.max(10, math.floor(content * (r.prompt or 0.20)))
-    L.chat_w = math.max(10, content - L.file_w - L.prompt_w)
+    L.file_w = math.max(8, math.floor(content * (w.ratios.file or 0.38)))
+    L.chat_w = math.max(20, content - L.file_w)
   elseif w.layout == "columns" then
-    -- two side-by-side panes: conversation | prompt (no buffer pane)
-    local content = width - 5 -- 2 borders + 1 gap
-    local r = w.ratios
+    -- no buffer pane: chat area at full width
     L.mode = "columns"
     L.file_w = 0
-    L.prompt_w = math.max(10, math.floor(content * (r.prompt or 0.30)))
-    L.chat_w = math.max(10, content - L.prompt_w)
+    L.chat_w = math.max(20, width - 2)
   else
     local input_h = w.input_height + 2 -- + border
     L.mode = "stacked"
@@ -175,15 +170,16 @@ local function pane_geometry()
   end
   if L.mode == "columns" then
     local x = L.col
-    local function col_pane(kind, w, title)
-      add(kind, w, L.height - 2, L.row, x, title)
-      x = x + w + 3 -- border (2) + gap (1)
-    end
     if L.file_w > 0 then
-      col_pane("file", L.file_w, " " .. file_pane_title(chat.origin_buf) .. " ")
+      add("file", L.file_w, L.height - 2, L.row, x, " " .. file_pane_title(chat.origin_buf) .. " ")
+      x = x + L.file_w + 3 -- border (2) + gap (1)
     end
-    col_pane("chat", L.chat_w, " AIP Chat ")
-    col_pane("prompt", L.prompt_w, " Prompt ")
+    -- the chat area is split vertically: transcript on top, prompt below
+    local chat_h = L.height - 5 -- 2 borders per window + 1 row gap
+    local t_h = math.max(3, math.floor(chat_h * (cfg().window.transcript_ratio or 0.70)))
+    local p_h = math.max(1, chat_h - t_h)
+    add("chat", L.chat_w, t_h, L.row, x, " AIP Chat ")
+    add("prompt", L.chat_w, p_h, L.row + t_h + 3, x, " Prompt ")
   else
     add("chat", L.width, L.transcript_h, L.row, L.col, " AIP Chat ")
     add("prompt", L.width, L.input_lines, L.row + L.transcript_h + 2 + 1, L.col, " Prompt ")

@@ -35,12 +35,16 @@ M.defaults = {
   save_model = true,
 
   window = {
-    -- "columns": 3 side-by-side panes — buffer | conversation | prompt.
-    -- "stacked": conversation on top, a short prompt at the bottom.
+    -- "columns": buffer pane on the left; on the right the chat area is
+    -- split vertically (transcript over prompt). "stacked": chat area only,
+    -- transcript over a short prompt, full width.
     layout = "columns",
-    -- Pane widths for "columns" (fractions of the chat area; the remainder
-    -- goes to the conversation). Set file = 0 to hide the buffer pane.
-    ratios = { file = 0.38, chat = 0.42, prompt = 0.20 },
+    -- Horizontal split for "columns": fraction given to the buffer pane;
+    -- the chat area gets the rest. Set file = 0 to hide the buffer pane.
+    ratios = { file = 0.38, chat = 0.62 },
+    -- Vertical split inside the chat area: fraction of the height given to
+    -- the transcript; the prompt gets the rest (0.70 → 70% / 30%).
+    transcript_ratio = 0.70,
     width = 0.85, -- <= 1 → fraction of the screen, otherwise columns
     height = 0.8, -- <= 1 → fraction of the screen, otherwise rows
     input_height = 3, -- prompt content lines ("stacked" layout)
