@@ -6,20 +6,21 @@ stream answers into a markdown-rendered transcript, then insert full replies —
 or just their code blocks — back into the buffer you were editing.
 
 ```
-┌─ AIP Chat ─────────────────────────────────────────────────────┐
-│ ## You                                                        │
-│ reverse a list in python                                      │
-│                                                               │
-│ ## qwen2.5-coder:7b                                           │
-│ Here you go:                                                  │
-│ ```python                                                     │
-│ my_list[::-1]                                                 │
-│ ```                                                           │
-└───────────────────────────────────────────────────────────────┘
-┌─ Prompt ───────────────────────────────────────────────────────┐
-│ ask anything… <CR> sends, <C-j> adds a line                    │
-└───────────────────────────────────────────────────────────────┘
+┌─ main.py — your code ──┬─── AIP Chat ────────┬── Prompt ────────────────┐
+│ def process(items):    │ ## You              │ ask anything…             │
+│     out = []           │                     │                           │
+│     for i in items:    │ ## qwen2.5-coder:7b │ <CR> sends                │
+│         out.append(-i) │ ```python           │ <C-j> adds a line         │
+│     return out         │ items[::-1]         │ <C-b> jumps to your code  │
+│                       │ ```                 │                           │
+└───────────────────────┴──────────────────────┴───────────────────────┘
 ```
+
+Three panes (all floating, so your window layout is untouched while the chat
+is closed): **your buffer** (fully editable — a real window into the file you
+were editing), **the conversation** (markdown-rendered, streaming) and the
+**prompt**. `c`/`e` insert replies below the buffer pane's cursor, and its
+cursor is carried back to your window when you close the chat.
 
 ## Requirements
 
@@ -66,7 +67,11 @@ Inside the chat (transcript window):
 | `<C-c>` / `q` | stop generating / close |
 
 Prompt window: `<CR>` sends, `<C-j>` inserts a newline (multi-line prompts),
-`<C-c>` stops generating.
+`<C-t>` shows the transcript, `<C-b>` jumps to the buffer pane (your code,
+edits work), `<C-c>` stops generating. `<C-w>w` cycles between all panes.
+
+Prefer a single wide conversation with a short prompt at the bottom? Set
+`window.layout = "stacked"`.
 
 The model chosen at runtime is remembered between sessions
 (`stdpath("data") .. "/aip-model"`), unless `save_model = false`.
@@ -111,9 +116,14 @@ vim.keymap.set("x", "<leader>ac", function() require("nvim-fsan-aip.ui").chat_ab
   yank_register = "+",              -- register for the in-chat `y` action
   save_model = true,                -- remember the runtime-picked model
   window = {
+    layout = "columns",           -- "columns" = buffer|chat|prompt panes,
+                                   -- "stacked" = chat + short prompt below
+    ratios = { file = 0.38, chat = 0.42, prompt = 0.20 },
+                                   -- pane widths ("columns"; file = 0 hides
+                                   -- the buffer pane)
     width = 0.85,                   -- ≤ 1 → fraction of the screen
     height = 0.8,
-    input_height = 3,               -- prompt content lines
+    input_height = 3,               -- prompt lines ("stacked" layout)
     border = "rounded",
     winblend = 0,
   },
@@ -121,6 +131,7 @@ vim.keymap.set("x", "<leader>ac", function() require("nvim-fsan-aip.ui").chat_ab
     close = "q",
     focus_input = "i",
     focus_transcript = "<C-t>",
+    focus_buffer = "<C-b>",
     send = "<CR>",
     new_line = "<C-j>",
     stop = "<C-c>",

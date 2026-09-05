@@ -35,9 +35,15 @@ M.defaults = {
   save_model = true,
 
   window = {
+    -- "columns": 3 side-by-side panes — buffer | conversation | prompt.
+    -- "stacked": conversation on top, a short prompt at the bottom.
+    layout = "columns",
+    -- Pane widths for "columns" (fractions of the chat area; the remainder
+    -- goes to the conversation). Set file = 0 to hide the buffer pane.
+    ratios = { file = 0.38, chat = 0.42, prompt = 0.20 },
     width = 0.85, -- <= 1 → fraction of the screen, otherwise columns
     height = 0.8, -- <= 1 → fraction of the screen, otherwise rows
-    input_height = 3, -- prompt content lines
+    input_height = 3, -- prompt content lines ("stacked" layout)
     border = "rounded",
     winblend = 0,
   },
@@ -47,6 +53,7 @@ M.defaults = {
     close = "q",
     focus_input = "i",
     focus_transcript = "<C-t>",
+    focus_buffer = "<C-b>",
     send = "<CR>",
     new_line = "<C-j>",
     stop = "<C-c>",

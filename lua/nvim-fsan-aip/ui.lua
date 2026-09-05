@@ -18,6 +18,8 @@ local chat = {
   win = nil,
   input_buf = nil,
   input_win = nil,
+  file_win = nil, -- buffer pane (shows the buffer the chat was opened from)
+  origin_buf = nil, -- buffer displayed in the file pane
   augroup = nil,
   pending = "", -- streamed text not yet flushed to the transcript
   flush_timer = nil,
@@ -106,6 +108,23 @@ local function transcript_text(from)
   return table.concat(lines, "\n")
 end
 
+-- Buffer-pane helpers ------------------------------------------------------------------
+
+-- Only plain file buffers make sense in the buffer pane (no terminals,
+-- quickfix, help, ... — those fall back to a 2-pane layout).
+local function file_pane_ok(buf)
+  if not valid_buf(buf) then
+    return false
+  end
+  local bt = vim.bo[buf].buftype
+  return (bt == "" or bt == "acwrite") and vim.bo[buf].buflisted
+end
+
+local function file_pane_title(buf)
+  local name = vim.api.nvim_buf_get_name(buf or 0)
+  return (name ~= "" and vim.fn.fnamemodify(name, ":t") or "[No Name]") .. " — your code"
+end
+
 -- Layout ----------------------------------------------------------------------
 
 local function layout()
@@ -115,16 +134,61 @@ local function layout()
   local height = w.height <= 1 and math.floor(screen_rows * w.height) or w.height
   width = math.min(width, columns - 4)
   height = math.min(height, screen_rows - 4)
-  local input_h = w.input_height + 2 -- + border
-  local transcript_h = math.max(3, height - input_h - 1) -- 1 row gap
-  return {
+  local L = {
     width = width,
-    transcript_h = transcript_h,
-    input_h = input_h,
-    input_lines = w.input_height,
+    height = height,
     row = math.floor((screen_rows - height) / 2),
     col = math.floor((columns - width) / 2),
   }
+  if w.layout == "columns" and (w.ratios.file or 0) > 0 and file_pane_ok(chat.origin_buf) then
+    -- three side-by-side panes: buffer | conversation | prompt
+    local content = width - 8 -- 3 borders (2 each) + 2 gaps
+    local r = w.ratios
+    L.mode = "columns"
+    L.file_w = math.max(8, math.floor(content * r.file))
+    L.prompt_w = math.max(10, math.floor(content * (r.prompt or 0.20)))
+    L.chat_w = math.max(10, content - L.file_w - L.prompt_w)
+  elseif w.layout == "columns" then
+    -- two side-by-side panes: conversation | prompt (no buffer pane)
+    local content = width - 5 -- 2 borders + 1 gap
+    local r = w.ratios
+    L.mode = "columns"
+    L.file_w = 0
+    L.prompt_w = math.max(10, math.floor(content * (r.prompt or 0.30)))
+    L.chat_w = math.max(10, content - L.prompt_w)
+  else
+    local input_h = w.input_height + 2 -- + border
+    L.mode = "stacked"
+    L.transcript_h = math.max(3, height - input_h - 1) -- 1 row gap
+    L.input_lines = w.input_height
+  end
+  return L
+end
+
+-- Ordered pane specs ({kind, width, height, row, col, title}) for the current
+-- layout — shared by open_windows() and resize().
+local function pane_geometry()
+  local L = layout()
+  local specs = {}
+  local function add(kind, width, height, row, col, title)
+    specs[#specs + 1] = { kind = kind, width = width, height = height, row = row, col = col, title = title }
+  end
+  if L.mode == "columns" then
+    local x = L.col
+    local function col_pane(kind, w, title)
+      add(kind, w, L.height - 2, L.row, x, title)
+      x = x + w + 3 -- border (2) + gap (1)
+    end
+    if L.file_w > 0 then
+      col_pane("file", L.file_w, " " .. file_pane_title(chat.origin_buf) .. " ")
+    end
+    col_pane("chat", L.chat_w, " AIP Chat ")
+    col_pane("prompt", L.prompt_w, " Prompt ")
+  else
+    add("chat", L.width, L.transcript_h, L.row, L.col, " AIP Chat ")
+    add("prompt", L.width, L.input_lines, L.row + L.transcript_h + 2 + 1, L.col, " Prompt ")
+  end
+  return specs
 end
 
 -- Buffers & keymaps ------------------------------------------------------------
@@ -170,6 +234,7 @@ local function set_keymaps()
   map("n", ib, K.close, M.close, "close chat")
   map("i", ib, K.new_line, M.insert_newline, "new line in prompt")
   map("i", ib, K.focus_transcript, M.focus_transcript, "view transcript")
+  map("i", ib, K.focus_buffer, M.focus_file_pane, "edit the buffer pane")
 end
 
 function M.update_winbars()
@@ -181,7 +246,7 @@ function M.update_winbars()
   vim.wo[chat.win].winbar = ("󰚩 AIP · %s%s %%= i input · y yank · c copy · e code · m model · n new · q close")
     :format(c.model, status)
   if valid_win(chat.input_win) then
-    vim.wo[chat.input_win].winbar = "» Prompt %= ⏎ send · ⌃J newline · ⌃C stop · ⌃T transcript"
+    vim.wo[chat.input_win].winbar = "» Prompt %= ⏎ send · ⌃J newline · ⌃T transcript · ⌃B buffer · ⌃C stop"
   end
 end
 
@@ -208,6 +273,9 @@ function M.render_welcome()
     "",
     "Add code context with `<leader>ac` — long selections become a compact",
     "`[[Pasted text #N]]` placeholder, expanded to the full code on send.",
+    "",
+    "With the 3-pane layout your code shows in the left pane — edit it freely",
+    ("while chatting; `c`/`e` insert below its cursor, and `%s` jumps to it."):format(K.focus_buffer),
     "",
   })
 end
@@ -301,6 +369,16 @@ function M.focus_transcript()
   M.scroll_to_bottom()
 end
 
+-- Jump to the buffer pane (your code, fully editable).
+function M.focus_file_pane()
+  if not valid_win(chat.file_win) then
+    vim.notify("AIP: no buffer pane open", vim.log.levels.WARN)
+    return
+  end
+  vim.api.nvim_set_current_win(chat.file_win)
+  pcall(vim.cmd, "stopinsert")
+end
+
 -- Open / close / toggle -----------------------------------------------------------
 
 function M.is_open()
@@ -309,43 +387,57 @@ end
 
 -- Accessors (mostly for tests / statusline integration).
 function M.wins()
-  return { buf = chat.buf, win = chat.win, input_buf = chat.input_buf, input_win = chat.input_win }
+  return {
+    buf = chat.buf,
+    win = chat.win,
+    input_buf = chat.input_buf,
+    input_win = chat.input_win,
+    file_win = chat.file_win,
+    origin_buf = chat.origin_buf,
+  }
 end
 
 local function open_windows()
-  local L = layout()
-  chat.win = vim.api.nvim_open_win(chat.buf, false, {
-    relative = "editor",
-    width = L.width,
-    height = L.transcript_h,
-    row = L.row,
-    col = L.col,
-    border = cfg().window.border,
-    style = "minimal",
-    zindex = 40,
-    title = " AIP Chat ",
-    title_pos = "center",
-  })
-  chat.input_win = vim.api.nvim_open_win(chat.input_buf, true, {
-    relative = "editor",
-    width = L.width,
-    height = L.input_lines,
-    row = L.row + L.transcript_h + 2 + 1,
-    col = L.col,
-    border = cfg().window.border,
-    style = "minimal",
-    zindex = 40,
-    title = " Prompt ",
-    title_pos = "center",
-  })
+  local buffers = { chat = chat.buf, prompt = chat.input_buf, file = chat.origin_buf }
+  for _, spec in ipairs(pane_geometry()) do
+    local win = vim.api.nvim_open_win(buffers[spec.kind], spec.kind == "prompt", {
+      relative = "editor",
+      width = spec.width,
+      height = spec.height,
+      row = spec.row,
+      col = spec.col,
+      border = cfg().window.border,
+      style = "minimal",
+      zindex = 40,
+      title = spec.title,
+      title_pos = "center",
+    })
+    if spec.kind == "chat" then
+      chat.win = win
+    elseif spec.kind == "prompt" then
+      chat.input_win = win
+    else
+      chat.file_win = win
+    end
 
-  for _, win in ipairs({ chat.win, chat.input_win }) do
+    -- Window options common to all panes
     vim.wo[win].wrap = true
     vim.wo[win].linebreak = true
     vim.wo[win].winblend = cfg().window.winblend
-    vim.wo[win].foldenable = false
     vim.wo[win].spell = false
     vim.wo[win].scrolloff = 0
+    vim.wo[win].foldenable = false
+    if spec.kind == "file" then
+      -- The buffer pane is a real window into the user's buffer: keep it
+      -- editable, mirror the origin cursor, show line numbers.
+      vim.wo[win].number = true
+      vim.wo[win].relativenumber = false
+      vim.wo[win].signcolumn = "yes"
+      vim.wo[win].cursorline = true
+      if valid_win(state.origin_win) and vim.api.nvim_win_get_buf(state.origin_win) == chat.origin_buf then
+        pcall(vim.api.nvim_win_set_cursor, win, vim.api.nvim_win_get_cursor(state.origin_win))
+      end
+    end
   end
 
   M.update_winbars()
@@ -365,6 +457,7 @@ function M.open(opts)
   end
 
   state.origin_win = vim.api.nvim_get_current_win()
+  chat.origin_buf = vim.api.nvim_win_get_buf(state.origin_win)
 
   if not valid_buf(chat.buf) then
     chat.buf = make_buffer("nvim-fsan-aip://transcript", "markdown")
@@ -405,12 +498,17 @@ function M.close()
     return
   end
   chat.open = false
-  for _, w in ipairs({ chat.win, chat.input_win }) do
+  -- Carry the buffer-pane cursor back to the origin window (same buffer only).
+  if valid_win(chat.file_win) and valid_win(state.origin_win)
+    and vim.api.nvim_win_get_buf(chat.file_win) == vim.api.nvim_win_get_buf(state.origin_win) then
+    pcall(vim.api.nvim_win_set_cursor, state.origin_win, vim.api.nvim_win_get_cursor(chat.file_win))
+  end
+  for _, w in ipairs({ chat.win, chat.input_win, chat.file_win }) do
     if valid_win(w) then
       pcall(vim.api.nvim_win_close, w, true)
     end
   end
-  chat.win, chat.input_win = nil, nil
+  chat.win, chat.input_win, chat.file_win = nil, nil, nil
   if chat.augroup then
     pcall(vim.api.nvim_del_augroup_by_name, "AipWin")
     chat.augroup = nil
@@ -434,21 +532,19 @@ function M.resize()
   if not M.is_open() then
     return
   end
-  local L = layout()
-  vim.api.nvim_win_set_config(chat.win, {
-    relative = "editor",
-    width = L.width,
-    height = L.transcript_h,
-    row = L.row,
-    col = L.col,
-  })
-  vim.api.nvim_win_set_config(chat.input_win, {
-    relative = "editor",
-    width = L.width,
-    height = L.input_lines,
-    row = L.row + L.transcript_h + 2 + 1,
-    col = L.col,
-  })
+  local wins = { chat = chat.win, prompt = chat.input_win, file = chat.file_win }
+  for _, spec in ipairs(pane_geometry()) do
+    local win = wins[spec.kind]
+    if valid_win(win) then
+      vim.api.nvim_win_set_config(win, {
+        relative = "editor",
+        width = spec.width,
+        height = spec.height,
+        row = spec.row,
+        col = spec.col,
+      })
+    end
+  end
 end
 
 -- Streaming ---------------------------------------------------------------------
@@ -603,7 +699,10 @@ end
 -- Insert `text` below the cursor of the window the chat was opened from
 -- (falls back to the current window if that window is gone).
 local function insert_into_origin(text)
-  local win = valid_win(state.origin_win) and state.origin_win or vim.api.nvim_get_current_win()
+  -- Prefer the visible buffer pane (that's where the user is looking);
+  -- fall back to the hidden origin window, then to the current window.
+  local win = valid_win(chat.file_win) and chat.file_win
+    or (valid_win(state.origin_win) and state.origin_win or vim.api.nvim_get_current_win())
   local buf = vim.api.nvim_win_get_buf(win)
   local row = vim.api.nvim_win_get_cursor(win)[1] -- 1-based
   local lines = vim.split(text, "\n", { plain = true })
