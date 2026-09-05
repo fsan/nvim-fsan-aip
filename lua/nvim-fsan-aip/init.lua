@@ -30,14 +30,12 @@ local function define_commands()
 
   vim.api.nvim_create_user_command("AipChat", function(o)
     if o.args ~= "" then
-      -- `:AipChat question` (optionally with a range for extra context)
       local args = o.args
       if o.range > 0 then
-        local buf = vim.api.nvim_get_current_buf()
-        local lines = vim.api.nvim_buf_get_lines(buf, o.line1 - 1, o.line2, false)
-        local ctx = table.concat(lines, "\n")
-        if ctx ~= "" then
-          args = args .. "\n\n```" .. vim.bo[buf].filetype .. "\n" .. ctx .. "\n```"
+        -- register the range BEFORE opening (while its buffer is still current)
+        local snip = ui().context_snippet(vim.api.nvim_get_current_buf(), o.line1, o.line2)
+        if snip then
+          args = args .. "\n\n" .. snip
         end
       end
       ui().open_and_send(args)

@@ -206,6 +206,9 @@ function M.render_welcome()
     ("| `%s` / `%s` | change model / new conversation |"):format(K.select_model, K.new_chat),
     ("| `%s` / `%s` | stop generating / close the chat |"):format(K.stop, K.close),
     "",
+    "Add code context with `<leader>ac` — long selections become a compact",
+    "`[[Pasted text #N]]` placeholder, expanded to the full code on send.",
+    "",
   })
 end
 
@@ -232,6 +235,35 @@ local function set_prompt_lines(lines)
   vim.api.nvim_buf_set_lines(chat.input_buf, 0, -1, false, lines)
   if valid_win(chat.input_win) then
     pcall(vim.api.nvim_win_set_cursor, chat.input_win, { math.max(1, #lines), 0 })
+  end
+end
+
+-- Insert lines at the prompt cursor, keeping whatever is already typed
+-- there (the insertion lands after the cursor's line; the cursor moves to
+-- the end of the inserted text).
+local function insert_prompt_lines(lines)
+  if not valid_buf(chat.input_buf) or not lines or #lines == 0 then
+    return
+  end
+  local count = vim.api.nvim_buf_line_count(chat.input_buf)
+  local empty = count == 1
+    and (vim.api.nvim_buf_get_lines(chat.input_buf, 0, 1, false)[1] or ""):match("^%s*$") ~= nil
+  local row = 1
+  if valid_win(chat.input_win) then
+    row = vim.api.nvim_win_get_cursor(chat.input_win)[1]
+  end
+  local at = empty and 0 or row
+  vim.api.nvim_buf_set_lines(chat.input_buf, at, at, false, lines)
+  if valid_win(chat.input_win) then
+    pcall(vim.api.nvim_win_set_cursor, chat.input_win, { at + #lines, 0 })
+  end
+end
+
+local function ensure_insert()
+  if #vim.api.nvim_list_uis() > 0 then
+    vim.schedule(function()
+      pcall(vim.cmd, "startinsert")
+    end)
   end
 end
 
@@ -319,9 +351,12 @@ local function open_windows()
   M.update_winbars()
 end
 
-function M.open()
+function M.open(opts)
+  opts = opts or {}
   if M.is_open() then
-    M.focus_input()
+    if opts.focus ~= false then
+      M.focus_input()
+    end
     return
   end
   if vim.fn.executable("curl") ~= 1 then
@@ -360,7 +395,9 @@ function M.open()
     callback = M.resize,
   })
 
-  M.focus_input()
+  if opts.focus ~= false then
+    M.focus_input()
+  end
 end
 
 function M.close()
@@ -439,8 +476,8 @@ function M.send()
       vim.log.levels.WARN)
     return
   end
-  local text = M.get_prompt_text()
-  if text == "" then
+  local raw = M.get_prompt_text()
+  if raw == "" then
     return
   end
   if vim.fn.executable("curl") ~= 1 then
@@ -449,10 +486,13 @@ function M.send()
   end
 
   local model = cfg().model
+  -- Expand "[[Pasted text #N]]" tokens for the model; the transcript keeps
+  -- the compact placeholders.
+  local text = M.substitute_pastes(raw)
   table.insert(state.history, { role = "user", content = text })
 
   local out = { "", "## You", "" }
-  vim.list_extend(out, vim.split(text, "\n", { plain = true }))
+  vim.list_extend(out, vim.split(raw, "\n", { plain = true }))
   vim.list_extend(out, { "", ("## %s"):format(model), "" })
   append_lines(out)
   chat.reply_start = vim.api.nvim_buf_line_count(chat.buf) + 1
@@ -683,29 +723,65 @@ end
 
 -- Entry points --------------------------------------------------------------------
 
--- Open the chat with a code selection as pre-filled context (visual selection,
--- `:'<,'>AipChat` or <leader>ac). The cursor lands after the fenced block,
--- ready to type the question.
+-- Build the prompt text for a buffer range: an inline fenced block for short
+-- selections, a compact "[[Pasted text #N]]" placeholder for long ones.
+-- Returns nil for an empty range. Call this while the buffer is still current
+-- (i.e. before opening the chat).
+function M.context_snippet(buf, line1, line2)
+  if not valid_buf(buf) or not line1 or not line2 or line2 < 1 or line2 < line1 then
+    return nil
+  end
+  local lines = vim.api.nvim_buf_get_lines(buf, line1 - 1, line2, false)
+  if #lines == 0 then
+    return nil
+  end
+  local ft = vim.bo[buf].filetype
+  local name = vim.api.nvim_buf_get_name(buf)
+  name = name ~= "" and vim.fn.fnamemodify(name, ":t") or ("buffer %d"):format(buf)
+
+  local c = cfg()
+  if c.paste_threshold == false or #lines <= c.paste_threshold then
+    local block = { ("```%s — %s"):format(ft, name) }
+    vim.list_extend(block, lines)
+    table.insert(block, "```")
+    return table.concat(block, "\n")
+  end
+  return state.add_paste(lines, ft, name)
+end
+
+-- Expand "[[Pasted text #N]]" tokens into their stored fenced content.
+-- Unknown tokens are left as literal text.
+function M.substitute_pastes(text)
+  return (text:gsub("%[%[Pasted text #(%d+)%]%]", function(id)
+    local p = state.pastes[tonumber(id)]
+    if not p then
+      return nil
+    end
+    local block = { ("```%s — %s"):format(p.ft, p.name) }
+    vim.list_extend(block, p.lines)
+    table.insert(block, "```")
+    return table.concat(block, "\n")
+  end))
+end
+
+-- Open the chat with a code selection as context (visual selection,
+-- `:'<,'>AipChat` or <leader>ac). The context is ADDED at the prompt cursor —
+-- existing prompt text is never erased — and the cursor lands right after it.
 function M.open_with_context(line1, line2)
   local buf = vim.api.nvim_get_current_buf()
-  if line2 and line1 and line2 > 0 and line2 >= line1 then
-    local lines = vim.api.nvim_buf_get_lines(buf, line1 - 1, line2, false)
-    if #lines > 0 then
-      local ft = vim.bo[buf].filetype
-      local name = vim.api.nvim_buf_get_name(buf)
-      name = name ~= "" and vim.fn.fnamemodify(name, ":t") or ("buffer %d"):format(buf)
-      local block = {
-        ("```%s — %s"):format(ft, name),
-      }
-      vim.list_extend(block, lines)
-      vim.list_extend(block, { "```", "", "" })
-      M.open()
-      set_prompt_lines(block)
-      M.focus_input()
-      return
-    end
+  local snippet = M.context_snippet(buf, line1, line2)
+  if not snippet then
+    M.open()
+    return
   end
-  M.open()
+  local block = vim.split(snippet, "\n", { plain = true })
+  table.insert(block, "")
+  table.insert(block, "")
+
+  local was_open = M.is_open()
+  M.open({ focus = not was_open }) -- keep the prompt cursor if already open
+  insert_prompt_lines(block) -- add at the cursor; never erase the draft
+  ensure_insert()
 end
 
 function M.chat_about_selection()
@@ -725,10 +801,13 @@ function M.chat_about_selection()
   end
 end
 
--- Open the chat and immediately send `text` as the prompt.
+-- Open the chat and immediately send `text` as the prompt. The text is
+-- appended after anything already typed in the prompt (never erased).
 function M.open_and_send(text)
   M.open()
-  set_prompt_lines(vim.split(text, "\n", { plain = true }))
+  local lines = vim.split(text, "\n", { plain = true })
+  table.insert(lines, "")
+  insert_prompt_lines(lines)
   M.send()
 end
 

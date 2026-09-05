@@ -23,6 +23,11 @@ M.defaults = {
   options = {},
   -- Max user/assistant messages sent as context (oldest turns are dropped).
   history_limit = 40,
+  -- Selections up to this many lines are pasted inline into the prompt;
+  -- longer ones become a compact "[[Pasted text #N]]" placeholder that is
+  -- substituted with the full fenced block when the message is sent
+  -- (Claude Code style). Set to false to always paste inline.
+  paste_threshold = 5,
   -- Register used by the in-chat `y` yank action.
   yank_register = "+",
   -- Remember the model chosen at runtime across sessions
