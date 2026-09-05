@@ -1,0 +1,56 @@
+-- Conversation state: message history, origin window, runtime model choice.
+--
+-- The transcript/prompt buffers hold the rendered text; `history` holds the
+-- raw role/content pairs that are replayed to Ollama as context.
+
+local config = require("nvim-fsan-aip.config")
+
+local M = {
+  history = {}, -- { { role = "user"|"assistant", content = "..." }, ... }
+  last_response = "", -- full text of the last assistant reply
+  origin_win = nil, -- window the chat was opened from (copy-back target)
+  streaming = false,
+  handle = nil, -- streaming job handle ({ stop = fn } or nil)
+}
+
+function M.reset()
+  M.history = {}
+  M.last_response = ""
+  M.streaming = false
+  if M.handle then
+    M.handle.stop()
+    M.handle = nil
+  end
+end
+
+-- Model persistence (chosen via <leader>am is remembered between sessions).
+
+function M.model_file()
+  return vim.fn.stdpath("data") .. "/aip-model"
+end
+
+function M.load_saved_model()
+  local f = io.open(M.model_file(), "r")
+  if not f then
+    return nil
+  end
+  local name = f:read("*l") or ""
+  f:close()
+  name = name:gsub("^%s+", ""):gsub("%s+$", "")
+  return name ~= "" and name or nil
+end
+
+function M.save_model(name)
+  if not config.cfg.save_model then
+    return
+  end
+  pcall(function()
+    local f = io.open(M.model_file(), "w")
+    if f then
+      f:write(name, "\n")
+      f:close()
+    end
+  end)
+end
+
+return M
