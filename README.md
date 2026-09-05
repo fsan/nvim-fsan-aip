@@ -1,6 +1,7 @@
 # 󰚩 nvim-fsan-aip
 
-![Demo](demo.gif)
+![Demo](resources/demo.gif)
+![Demo](resources/demo-edit.gif)
 
 **AIP** (AI Pane) — a floating programming chat assistant for Neovim, backed by
 a [local Ollama](https://ollama.com) server. Toggle it anywhere, ask questions,
