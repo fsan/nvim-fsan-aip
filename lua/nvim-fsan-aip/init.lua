@@ -72,11 +72,11 @@ local function define_commands()
 
   vim.api.nvim_create_user_command("AipEdit", function(o)
     local ui = require("nvim-fsan-aip.ui")
+    local prompt = o.args ~= "" and o.args or nil
     if o.range > 0 then
-      ui.edit_open(o.line1, o.line2, o.args ~= "" and table.concat(o.args, " ") or nil,
-        o.args ~= "")
+      ui.edit_open(o.line1, o.line2, prompt, o.args ~= "")
     else
-      ui.edit_open(nil, nil, o.args ~= "" and table.concat(o.args, " ") or nil, o.args ~= "")
+      ui.edit_open(nil, nil, prompt, o.args ~= "")
     end
   end, {
     nargs = "*",

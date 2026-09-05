@@ -28,6 +28,9 @@ file you were editing), and on the right the **conversation** above the
 the buffer pane's cursor, and its cursor is carried back to your window when
 you close the chat.
 
+For quick changes without opening a conversation there is also a Copilot-style
+**inline edit pane** (`:AipEdit` / `<leader>ai`) — see [Inline edit](#inline-edit-copilot-style).
+
 ## Requirements
 
 - Neovim **≥ 0.10** (`vim.system`)
@@ -59,6 +62,7 @@ to the default.
 | `:AipNew` | new conversation |
 | `:AipStop` | abort the running generation |
 | `:AipStatus` | show host, model and reachable-model count |
+| `:AipEdit [prompt]` | inline edit pane (see below); range → selection is the target |
 
 Inside the chat (transcript window):
 
@@ -81,6 +85,39 @@ Prefer a full-width conversation with a short prompt and no buffer pane? Set
 
 The model chosen at runtime is remembered between sessions
 (`stdpath("data") .. "/aip-model"`), unless `save_model = false`.
+
+## Inline edit (Copilot style)
+
+`<leader>ai` (or `:AipEdit [prompt]`) opens a small floating pane anchored to
+the bottom of the screen — your code stays visible above it — for quick
+"do X to this code" requests:
+
+```
+┌─ main.py — your code (unchanged, visible) ──────────────┐
+│ def process(items):                                     │
+│     out = []            # selection ↓ (or cursor line)  │
+│     for i in items: ... │                              │
+├───────────── AIP Edit · fake:1b ──────────────┐       │
+│ ## fake:1b                                     │       │
+│ out = [-i for i in items]   ← streams here    │       │
+│ (y/<C-y> accept · n/<C-n> reject)              │       │
+├── Instruction ────────────────┐                │       │
+│ make it a comprehension  ⏎    │                │       │
+└───────────────────────────────┴────────────────┘       │
+```
+
+- With a **selection** (`<leader>ai` in visual mode, or `:'<,'>AipEdit`) the
+  selected lines are sent as the code to change and **accept replaces them**.
+- Without one, the reply is **inserted below the cursor**.
+- The prompt asks the model for raw replacement code only; if it answers with
+  markdown fences anyway, only the code inside is applied.
+- `y`/`<C-y>` accept (applies to the buffer, cursor lands on the new code),
+  `n`/`<C-n>` reject (buffer untouched), `i` refine the instruction and
+  re-send, `<C-c>` stop, `q`/`<Esc>` discard. Applied changes are ordinary
+  edits — `u` undoes them.
+
+This pane is independent from the chat: it never touches the conversation
+history, and both can be open at the same time.
 
 ## Code context & paste placeholders
 
@@ -105,6 +142,10 @@ vim.keymap.set("n", "<leader>aa", function() require("nvim-fsan-aip.ui").toggle(
   { desc = "AIP: toggle chat" })
 vim.keymap.set("x", "<leader>ac", function() require("nvim-fsan-aip.ui").chat_about_selection() end,
   { desc = "AIP: ask about selection" })
+vim.keymap.set("n", "<leader>ai", function() require("nvim-fsan-aip.ui").edit_open() end,
+  { desc = "AIP: inline edit" })
+vim.keymap.set("x", "<leader>ai", function() require("nvim-fsan-aip.ui").edit_about_selection() end,
+  { desc = "AIP: edit selection" })
 ```
 
 ## Options
@@ -149,6 +190,14 @@ vim.keymap.set("x", "<leader>ac", function() require("nvim-fsan-aip.ui").chat_ab
     copy_code = "e",
     select_model = "m",
     new_chat = "n",
+    edit_accept = "<C-y>",          -- inline edit pane (y always works too)
+    edit_reject = "<C-n>",          -- (n always works too)
+  },
+  edit_system_prompt = "...",       -- inline edit: raw replacement code only
+  edit_window = {                    -- inline edit pane geometry
+    width = 0.6,                     -- ≤ 1 → fraction of the screen
+    height = 0.4,
+    prompt_height = 2,               -- instruction lines
   },
 }
 ```

@@ -26,6 +26,26 @@ local chat = {
   reply_start = 1, -- transcript line where the current reply starts
 }
 
+-- Inline edit pane state (see the "Inline edit pane" section at the bottom).
+-- Declared up front so earlier functions (e.g. M.stop) can reference it.
+local edit = {
+  open = false,
+  buf = nil, -- preview buffer (the proposed code)
+  win = nil,
+  input_buf = nil, -- instruction buffer
+  input_win = nil,
+  origin_win = nil,
+  target_buf = nil,
+  target_start = 0, -- 0-based, inclusive
+  target_end = 0, -- 0-based, exclusive (insert mode: == target_start)
+  replace = false, -- true → replace target range; false → insert below cursor
+  last_code = "",
+  streaming = false,
+  handle = nil,
+  pending = "",
+  timer = nil,
+}
+
 local function cfg()
   return config.cfg
 end
@@ -940,24 +960,6 @@ end
 -- streams into the preview, then accept (replace the selection / insert at
 -- the cursor) or reject (discard, buffer untouched).
 
-local edit = {
-  open = false,
-  buf = nil, -- preview buffer (the proposed code)
-  win = nil,
-  input_buf = nil, -- instruction buffer
-  input_win = nil,
-  origin_win = nil,
-  target_buf = nil,
-  target_start = 0, -- 0-based, inclusive
-  target_end = 0, -- 0-based, exclusive (insert mode: == target_start)
-  replace = false, -- true → replace target range; false → insert below cursor
-  last_code = "",
-  streaming = false,
-  handle = nil,
-  pending = "",
-  timer = nil,
-}
-
 function M.edit_is_open()
   return edit.open and valid_win(edit.win) and valid_win(edit.input_win)
 end
@@ -1062,11 +1064,14 @@ local function edit_layout()
   height = math.min(height, screen_rows - 4)
   local prompt_h = math.max(1, w.prompt_height or 2)
   local preview_h = math.max(3, height - prompt_h - 5) -- borders + 1 row gap
+  -- anchor to the bottom: the whole pane (borders incl.) ends 1 row above
+  -- the last screen row (the command line stays visible below it)
+  local row = screen_rows - (preview_h + prompt_h + 5) - 1
   return {
     width = width,
     prompt_h = prompt_h,
     preview_h = preview_h,
-    row = screen_rows - height - 1, -- anchored to the bottom
+    row = row,
     col = math.floor((columns - width) / 2),
   }
 end
