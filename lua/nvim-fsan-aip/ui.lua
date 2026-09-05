@@ -270,6 +270,10 @@ function M.render_welcome()
     "Add code context with `<leader>ac` — long selections become a compact",
     "`[[Pasted text #N]]` placeholder, expanded to the full code on send.",
     "",
+    "For quick code changes use `<leader>ai` (inline edit pane): the",
+    "selection — or the cursor — is the target, and the reply is applied",
+    "(`y` accept · `n` reject).",
+    "",
     "With the 3-pane layout your code shows in the left pane — edit it freely",
     ("while chatting; `c`/`e` insert below its cursor, and `%s` jumps to it."):format(K.focus_buffer),
     "",
@@ -338,6 +342,16 @@ function M.insert_newline()
   local row = vim.api.nvim_win_get_cursor(chat.input_win)[1]
   vim.api.nvim_buf_set_lines(chat.input_buf, row, row, false, { "" })
   pcall(vim.api.nvim_win_set_cursor, chat.input_win, { row + 1, 0 })
+end
+
+-- Shared by M.insert_newline (chat prompt) and the edit-pane prompt.
+local function insert_newline_at(win, buf)
+  if not valid_win(win) then
+    return
+  end
+  local row = vim.api.nvim_win_get_cursor(win)[1]
+  vim.api.nvim_buf_set_lines(buf, row, row, false, { "" })
+  pcall(vim.api.nvim_win_set_cursor, win, { row + 1, 0 })
 end
 
 function M.focus_input()
@@ -655,6 +669,9 @@ function M.stream_error(err)
 end
 
 function M.stop()
+  if edit.streaming then
+    M.edit_stop()
+  end
   if not state.streaming or not state.handle then
     return
   end
@@ -731,12 +748,9 @@ function M.copy_last_reply()
   insert_into_origin(state.last_response)
 end
 
-function M.copy_code_blocks()
-  local text = state.last_response
-  if text == "" then
-    vim.notify("AIP: no reply to copy yet", vim.log.levels.WARN)
-    return
-  end
+-- Extract the fenced code blocks from `text` (prose and text/output
+-- fences dropped). Returns nil when there are none.
+local function extract_code_blocks(text)
   local skip = { text = true, txt = true, output = true, console = true, log = true, plaintext = true }
   local blocks = {}
   for lang, body in text:gmatch("```([%w_%-]*)[^\n]*\n(.-)```") do
@@ -745,10 +759,23 @@ function M.copy_code_blocks()
     end
   end
   if #blocks == 0 then
+    return nil
+  end
+  return table.concat(blocks, "\n\n")
+end
+
+function M.copy_code_blocks()
+  local text = state.last_response
+  if text == "" then
+    vim.notify("AIP: no reply to copy yet", vim.log.levels.WARN)
+    return
+  end
+  local code = extract_code_blocks(text)
+  if not code then
     vim.notify("AIP: no fenced code blocks in the last reply", vim.log.levels.WARN)
     return
   end
-  insert_into_origin(table.concat(blocks, "\n\n"))
+  insert_into_origin(code)
 end
 
 -- Insert the visual selection of the transcript into the file.
@@ -904,6 +931,523 @@ function M.open_and_send(text)
   table.insert(lines, "")
   insert_prompt_lines(lines)
   M.send()
+end
+
+-- Inline edit pane (Copilot-style) --------------------------------------------
+-- A small floating instruction + preview pane anchored to the bottom of the
+-- screen (the code being edited stays visible above it). Ask for a code
+-- change — optionally targeting the visual selection — the proposed code
+-- streams into the preview, then accept (replace the selection / insert at
+-- the cursor) or reject (discard, buffer untouched).
+
+local edit = {
+  open = false,
+  buf = nil, -- preview buffer (the proposed code)
+  win = nil,
+  input_buf = nil, -- instruction buffer
+  input_win = nil,
+  origin_win = nil,
+  target_buf = nil,
+  target_start = 0, -- 0-based, inclusive
+  target_end = 0, -- 0-based, exclusive (insert mode: == target_start)
+  replace = false, -- true → replace target range; false → insert below cursor
+  last_code = "",
+  streaming = false,
+  handle = nil,
+  pending = "",
+  timer = nil,
+}
+
+function M.edit_is_open()
+  return edit.open and valid_win(edit.win) and valid_win(edit.input_win)
+end
+
+function M.edit_info()
+  return {
+    streaming = edit.streaming,
+    last_code = edit.last_code,
+    target_buf = edit.target_buf,
+    replace = edit.replace,
+    target_start = edit.target_start,
+    target_end = edit.target_end,
+    input_buf = edit.input_buf,
+    preview_buf = edit.buf,
+  }
+end
+
+local function edit_append(lines)
+  if not valid_buf(edit.buf) or #lines == 0 then
+    return
+  end
+  vim.bo[edit.buf].modifiable = true
+  vim.api.nvim_buf_set_lines(edit.buf, -1, -1, false, lines)
+  vim.bo[edit.buf].modifiable = false
+  if valid_win(edit.win) then
+    local count = vim.api.nvim_buf_line_count(edit.buf)
+    pcall(vim.api.nvim_win_set_cursor, edit.win, { count, 0 })
+  end
+end
+
+local function edit_flush()
+  local text = edit.pending
+  if text == "" then
+    return
+  end
+  local lines = vim.split(text, "\n", { plain = true })
+  local partial = table.remove(lines)
+  if #lines > 0 then
+    edit_append(lines)
+  end
+  edit.pending = partial
+end
+
+local function edit_token(tok)
+  edit.pending = edit.pending .. tok
+  if not edit.timer then
+    local timer = vim.uv.new_timer()
+    edit.timer = timer
+    timer:start(40, 0, function()
+      vim.schedule(function()
+        if edit.timer == timer then
+          edit.timer = nil
+        end
+        timer:close()
+        edit_flush()
+      end)
+    end)
+  end
+end
+
+local function edit_get_instruction()
+  if not valid_buf(edit.input_buf) then
+    return ""
+  end
+  local lines = vim.api.nvim_buf_get_lines(edit.input_buf, 0, -1, false)
+  while #lines > 0 and lines[#lines]:match("^%s*$") do
+    lines[#lines] = nil
+  end
+  while #lines > 0 and lines[1]:match("^%s*$") do
+    table.remove(lines, 1)
+  end
+  return table.concat(lines, "\n")
+end
+
+local function edit_header_lines()
+  local name = vim.api.nvim_buf_get_name(edit.target_buf)
+  name = name ~= "" and vim.fn.fnamemodify(name, ":t") or "[No Name]"
+  local K = cfg().keys
+  if edit.replace then
+    local n = edit.target_end - edit.target_start
+    return {
+      "### AIP Edit",
+      ("→ replaces **%d line%s** in `%s` — y/%s accept · n/%s reject")
+        :format(n, n == 1 and "" or "s", name, K.edit_accept, K.edit_reject),
+      "",
+    }
+  end
+  return {
+    "### AIP Edit",
+    ("→ inserts below **line %d** in `%s` — y/%s accept · n/%s reject")
+      :format(edit.target_start + 1, name, K.edit_accept, K.edit_reject),
+    "",
+  }
+end
+
+local function edit_layout()
+  local w = cfg().edit_window
+  local columns, screen_rows = vim.o.columns, vim.o.lines
+  local width = w.width <= 1 and math.floor(columns * w.width) or w.width
+  local height = w.height <= 1 and math.floor(screen_rows * w.height) or w.height
+  width = math.min(width, columns - 4)
+  height = math.min(height, screen_rows - 4)
+  local prompt_h = math.max(1, w.prompt_height or 2)
+  local preview_h = math.max(3, height - prompt_h - 5) -- borders + 1 row gap
+  return {
+    width = width,
+    prompt_h = prompt_h,
+    preview_h = preview_h,
+    row = screen_rows - height - 1, -- anchored to the bottom
+    col = math.floor((columns - width) / 2),
+  }
+end
+
+local function edit_update_winbars()
+  if valid_win(edit.win) then
+    local status = edit.streaming and " · ⋯ generating" or ""
+    vim.wo[edit.win].winbar = ("󰚩 AIP Edit · %s%s %%= y/%s accept · n/%s reject · i refine · q close")
+      :format(cfg().model, status, cfg().keys.edit_accept, cfg().keys.edit_reject)
+  end
+  if valid_win(edit.input_win) then
+    vim.wo[edit.input_win].winbar = "» Instruction %= ⏎ send · ⌃J newline · ⌃C stop · Esc close"
+  end
+end
+
+local function edit_focus_prompt()
+  if not valid_win(edit.input_win) then
+    return
+  end
+  vim.api.nvim_set_current_win(edit.input_win)
+  local count = vim.api.nvim_buf_line_count(edit.input_buf)
+  local last = vim.api.nvim_buf_get_lines(edit.input_buf, -2, -1, false)
+  last = last[1] or ""
+  pcall(vim.api.nvim_win_set_cursor, edit.input_win, { count, #last })
+  ensure_insert()
+end
+
+local function edit_focus_preview()
+  if not valid_win(edit.win) then
+    return
+  end
+  vim.api.nvim_set_current_win(edit.win)
+  pcall(vim.cmd, "stopinsert")
+end
+
+local function edit_set_keymaps()
+  local K = cfg().keys
+  local b, ib = edit.buf, edit.input_buf
+
+  local function emap(mode, lhs, rhs, desc)
+    if not lhs or lhs == "" then
+      return
+    end
+    vim.keymap.set(mode, lhs, rhs, { buffer = ib, silent = true, desc = "AIP Edit: " .. desc })
+  end
+  emap("i", K.send, M.edit_send, "send instruction")
+  emap("n", K.send, M.edit_send, "send instruction")
+  emap("i", K.new_line, function()
+    insert_newline_at(edit.input_win, edit.input_buf)
+  end, "new line")
+  emap("i", K.stop, M.edit_stop, "stop generating")
+  emap("n", K.stop, M.edit_stop, "stop generating")
+  emap("n", K.close, M.edit_reject, "discard and close")
+  emap("n", "<Esc>", M.edit_reject, "discard and close")
+
+  -- Preview window (normal mode only: visual `y` still yanks natively).
+  local function pmap(mode, lhs, rhs, desc)
+    if not lhs or lhs == "" then
+      return
+    end
+    vim.keymap.set(mode, lhs, rhs, { buffer = b, silent = true, desc = "AIP Edit: " .. desc })
+  end
+  pmap("n", "y", M.edit_accept, "accept the proposal")
+  pmap("n", K.edit_accept, M.edit_accept, "accept the proposal")
+  pmap("n", "n", M.edit_reject, "reject the proposal")
+  pmap("n", K.edit_reject, M.edit_reject, "reject the proposal")
+  pmap("n", K.close, M.edit_reject, "discard and close")
+  pmap("n", "<Esc>", M.edit_reject, "discard and close")
+  pmap("n", K.stop, M.edit_stop, "stop generating")
+  pmap("n", K.focus_input, edit_focus_prompt, "refine the instruction")
+end
+
+-- line1..line2 (1-based, inclusive) → replace mode; no range → insert mode.
+-- `instruction` prefills the prompt; with `auto_send` the request fires at once.
+function M.edit_open(line1, line2, instruction, auto_send)
+  if vim.fn.executable("curl") ~= 1 then
+    vim.notify("AIP: `curl` is required but was not found on PATH", vim.log.levels.ERROR)
+    return
+  end
+
+  -- Capture the target BEFORE closing an old pane or opening floats.
+  edit.target_buf = vim.api.nvim_get_current_buf()
+  edit.origin_win = vim.api.nvim_get_current_win()
+  if line1 and line2 and line2 >= line1 and line2 > 0 then
+    edit.replace = true
+    edit.target_start, edit.target_end = line1 - 1, line2
+  else
+    edit.replace = false
+    local row = vim.api.nvim_win_get_cursor(edit.origin_win)[1]
+    edit.target_start, edit.target_end = row, row -- insert below the cursor line
+  end
+
+  if M.edit_is_open() then
+    M.edit_close()
+  end
+
+  if not valid_buf(edit.buf) then
+    edit.buf = make_buffer("nvim-fsan-aip://edit-preview", "markdown")
+    edit.input_buf = make_buffer("nvim-fsan-aip://edit-prompt", "")
+    vim.bo[edit.buf].modifiable = false
+    vim.bo[edit.buf].undolevels = -1
+    vim.bo[edit.input_buf].formatoptions = ""
+    vim.bo[edit.input_buf].textwidth = 0
+    pcall(function()
+      local ibl = require("ibl")
+      ibl.setup_buffer(edit.buf, { enabled = false })
+      ibl.setup_buffer(edit.input_buf, { enabled = false })
+    end)
+  end
+  edit_set_keymaps()
+
+  -- fresh preview + prompt
+  vim.bo[edit.buf].modifiable = true
+  vim.api.nvim_buf_set_lines(edit.buf, 0, -1, false, {})
+  vim.bo[edit.buf].modifiable = false
+  local prefill = {}
+  if instruction and instruction ~= "" then
+    prefill = vim.split(instruction, "\n", { plain = true })
+  end
+  vim.api.nvim_buf_set_lines(edit.input_buf, 0, -1, false, prefill)
+  edit.last_code = ""
+  edit.pending = ""
+  edit.streaming = false
+
+  local L = edit_layout()
+  local border = cfg().window.border
+  local blend = cfg().window.winblend
+  edit.win = vim.api.nvim_open_win(edit.buf, false, {
+    relative = "editor",
+    width = L.width,
+    height = L.preview_h,
+    row = L.row,
+    col = L.col,
+    border = border,
+    style = "minimal",
+    zindex = 45,
+    title = " AIP Edit ",
+    title_pos = "center",
+  })
+  edit.input_win = vim.api.nvim_open_win(edit.input_buf, true, {
+    relative = "editor",
+    width = L.width,
+    height = L.prompt_h,
+    row = L.row + L.preview_h + 3,
+    col = L.col,
+    border = border,
+    style = "minimal",
+    zindex = 45,
+    title = " Instruction ",
+    title_pos = "center",
+  })
+  for _, win in ipairs({ edit.win, edit.input_win }) do
+    vim.wo[win].wrap = true
+    vim.wo[win].linebreak = true
+    vim.wo[win].winblend = blend
+    vim.wo[win].foldenable = false
+    vim.wo[win].spell = false
+    vim.wo[win].scrolloff = 0
+  end
+
+  edit_append(edit_header_lines())
+  edit_update_winbars()
+  edit.open = true
+
+  vim.api.nvim_create_autocmd("VimResized", {
+    group = vim.api.nvim_create_augroup("AipEditWin", { clear = true }),
+    callback = M.edit_resize,
+  })
+
+  if instruction and instruction ~= "" and auto_send then
+    M.edit_send()
+  else
+    edit_focus_prompt()
+  end
+end
+
+function M.edit_resize()
+  if not M.edit_is_open() then
+    return
+  end
+  local L = edit_layout()
+  vim.api.nvim_win_set_config(edit.win, {
+    relative = "editor",
+    width = L.width,
+    height = L.preview_h,
+    row = L.row,
+    col = L.col,
+  })
+  vim.api.nvim_win_set_config(edit.input_win, {
+    relative = "editor",
+    width = L.width,
+    height = L.prompt_h,
+    row = L.row + L.preview_h + 3,
+    col = L.col,
+  })
+end
+
+function M.edit_send()
+  if edit.streaming then
+    vim.notify(("AIP Edit: still generating — %s to stop"):format(cfg().keys.stop), vim.log.levels.WARN)
+    return
+  end
+  local instruction = M.substitute_pastes(edit_get_instruction())
+  if instruction == "" then
+    vim.notify("AIP Edit: type an instruction first (what should change?)", vim.log.levels.WARN)
+    return
+  end
+
+  local c = cfg()
+  local msg = instruction
+  if edit.replace and valid_buf(edit.target_buf) then
+    local lines = vim.api.nvim_buf_get_lines(edit.target_buf, edit.target_start, edit.target_end, false)
+    if #lines > 0 then
+      local ft = vim.bo[edit.target_buf].filetype
+      msg = msg .. "\n\n```" .. ft .. "\n" .. table.concat(lines, "\n") .. "\n```"
+    end
+  end
+
+  edit_append({ "", "## " .. c.model, "" })
+  edit.streaming = true
+  edit_update_winbars()
+  edit.pending = ""
+  edit_focus_preview()
+  edit.handle = ollama.chat({
+    host = c.host,
+    api_key = c.api_key,
+    model = c.model,
+    messages = {
+      { role = "system", content = c.edit_system_prompt },
+      { role = "user", content = msg },
+    },
+    options = c.options,
+  }, {
+    on_token = function(tok)
+      edit_token(tok)
+    end,
+    on_done = function(full)
+      vim.schedule(function()
+        M.edit_done(full)
+      end)
+    end,
+    on_error = function(err)
+      vim.schedule(function()
+        M.edit_error(err)
+      end)
+    end,
+  })
+end
+
+function M.edit_done(full)
+  if not edit.streaming then
+    return
+  end
+  edit_flush()
+  if edit.pending ~= "" then
+    edit_append(vim.split(edit.pending, "\n", { plain = true }))
+    edit.pending = ""
+  end
+  edit.streaming = false
+  edit.handle = nil
+  -- the edit prompt asks for raw code; be forgiving about fences anyway
+  edit.last_code = extract_code_blocks(full) or full:gsub("^%s+", ""):gsub("%s+$", "")
+  local K = cfg().keys
+  edit_append({ "", ("*(y/%s accept · n/%s reject)*"):format(K.edit_accept, K.edit_reject) })
+  edit_update_winbars()
+  edit_focus_preview()
+end
+
+function M.edit_error(err)
+  if not edit.streaming then
+    return
+  end
+  edit.streaming = false
+  edit.handle = nil
+  edit_flush()
+  if edit.pending ~= "" then
+    edit_append(vim.split(edit.pending, "\n", { plain = true }))
+    edit.pending = ""
+  end
+  edit_append({ "", ("⚠ **%s**"):format(err), "" })
+  edit_update_winbars()
+  vim.notify("AIP Edit: " .. err, vim.log.levels.ERROR)
+end
+
+function M.edit_stop()
+  if not edit.streaming or not edit.handle then
+    return
+  end
+  edit.handle.stop()
+  edit.handle = nil
+  edit_flush()
+  if edit.pending ~= "" then
+    edit_append(vim.split(edit.pending, "\n", { plain = true }))
+    edit.pending = ""
+  end
+  edit.streaming = false
+  edit_append({ "", "*⋯ stopped — y accepts what arrived*" })
+  edit_update_winbars()
+end
+
+-- Accept: replace the selection (or insert below the cursor) with the code.
+function M.edit_accept()
+  if edit.streaming then
+    vim.notify("AIP Edit: still generating — wait or press " .. cfg().keys.stop, vim.log.levels.WARN)
+    return
+  end
+  if edit.last_code == "" then
+    vim.notify("AIP Edit: nothing to accept yet", vim.log.levels.WARN)
+    return
+  end
+  if not valid_buf(edit.target_buf) then
+    vim.notify("AIP Edit: target buffer is gone", vim.log.levels.WARN)
+    M.edit_close()
+    return
+  end
+  local lines = vim.split(edit.last_code, "\n", { plain = true })
+  local ok = pcall(vim.api.nvim_buf_set_lines,
+    edit.target_buf, edit.target_start, edit.target_end, false, lines)
+  if not ok then
+    vim.notify("AIP Edit: cannot apply (target buffer is not modifiable)", vim.log.levels.ERROR)
+    return
+  end
+  if valid_win(edit.origin_win) and vim.api.nvim_win_get_buf(edit.origin_win) == edit.target_buf then
+    pcall(vim.api.nvim_win_set_cursor, edit.origin_win, { edit.target_start + 1, 0 })
+  end
+  vim.notify(("AIP Edit: applied %d line%s (%s)")
+    :format(#lines, #lines == 1 and "" or "s", edit.replace and "replaced selection" or "inserted"))
+  M.edit_close()
+end
+
+-- Reject: discard the proposal; the buffer stays untouched.
+function M.edit_reject()
+  M.edit_close()
+  vim.notify("AIP Edit: discarded")
+end
+
+-- Closing stops a running generation: unlike the chat pane there is nothing
+-- to keep streaming for once the pane is gone.
+function M.edit_close()
+  if not edit.open then
+    return
+  end
+  if edit.handle then
+    edit.handle.stop()
+    edit.handle = nil
+  end
+  if edit.timer then
+    local t = edit.timer
+    edit.timer = nil
+    pcall(function()
+      t:close()
+    end)
+  end
+  edit.streaming = false
+  edit.open = false
+  for _, w in ipairs({ edit.win, edit.input_win }) do
+    if valid_win(w) then
+      pcall(vim.api.nvim_win_close, w, true)
+    end
+  end
+  edit.win, edit.input_win = nil, nil
+  pcall(vim.api.nvim_del_augroup_by_name, "AipEditWin")
+  if valid_win(edit.origin_win) then
+    pcall(vim.api.nvim_set_current_win, edit.origin_win)
+  end
+end
+
+-- Visual-mode entry: target the selection under the cursor.
+function M.edit_about_selection()
+  local a, b
+  if vim.fn.mode():match("^[vV\22]") then
+    local v, dot = vim.fn.line("v"), vim.fn.line(".")
+    a, b = math.min(v, dot), math.max(v, dot)
+  else
+    local m1 = vim.api.nvim_buf_get_mark(0, "<")
+    local m2 = vim.api.nvim_buf_get_mark(0, ">")
+    if m1 and m2 and m1[1] >= 1 and m2[1] >= m1[1] then
+      a, b = m1[1], m2[1]
+    end
+  end
+  M.edit_open(a, b)
 end
 
 return M

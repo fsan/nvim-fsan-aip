@@ -7,6 +7,10 @@
 --   :AipNew             new conversation (<leader>an)
 --   :AipStop            stop generating (<leader>as)
 --   :AipStatus          host/model/status line
+--   :AipEdit [prompt]   Copilot-style inline edit (<leader>ai): the visual
+--                       selection (or, with none, the cursor line) is the target;
+--                       the reply can be accepted (replaces the selection /
+--                       inserts below the cursor) or rejected.
 --
 -- Configuration: defaults in lua/nvim-fsan-aip/config.lua, overridden via the
 -- `opts` of the spec in lua/plugins/chat.lua (host, model, system_prompt,
@@ -65,6 +69,20 @@ local function define_commands()
   vim.api.nvim_create_user_command("AipStop", function()
     require("nvim-fsan-aip.ui").stop()
   end, { desc = "AIP: stop generating" })
+
+  vim.api.nvim_create_user_command("AipEdit", function(o)
+    local ui = require("nvim-fsan-aip.ui")
+    if o.range > 0 then
+      ui.edit_open(o.line1, o.line2, o.args ~= "" and table.concat(o.args, " ") or nil,
+        o.args ~= "")
+    else
+      ui.edit_open(nil, nil, o.args ~= "" and table.concat(o.args, " ") or nil, o.args ~= "")
+    end
+  end, {
+    nargs = "*",
+    range = true,
+    desc = "AIP: inline edit — selection → replaced, no range → insert at cursor",
+  })
 
   vim.api.nvim_create_user_command("AipStatus", function()
     require("nvim-fsan-aip.ui").status()

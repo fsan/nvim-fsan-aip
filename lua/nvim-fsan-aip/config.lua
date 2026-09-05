@@ -34,6 +34,21 @@ M.defaults = {
   -- (stdpath("data") .. "/aip-model").
   save_model = true,
 
+  -- System prompt for the inline edit pane (:AipEdit / <leader>ai): the
+  -- model must answer with raw replacement code only.
+  edit_system_prompt = "You are a code editing assistant inside a Neovim buffer. "
+    .. "You receive code (a fenced block) and an instruction. Reply with ONLY "
+    .. "the replacement code — no explanations, no markdown fences, no prose. "
+    .. "Match the file's language and indentation.",
+
+  -- Inline edit pane geometry (floating, anchored to the bottom of the
+  -- screen so the code being edited stays visible above it).
+  edit_window = {
+    width = 0.6, -- <= 1 → fraction of the screen, otherwise columns
+    height = 0.4, -- <= 1 → fraction of the screen, otherwise rows
+    prompt_height = 2, -- instruction content lines
+  },
+
   window = {
     -- "columns": buffer pane on the left; on the right the chat area is
     -- split vertically (transcript over prompt). "stacked": chat area only,
@@ -66,6 +81,9 @@ M.defaults = {
     copy_code = "e",
     select_model = "m",
     new_chat = "n",
+    -- Inline edit pane (:AipEdit / <leader>ai)
+    edit_accept = "<C-y>",
+    edit_reject = "<C-n>",
   },
 }
 
